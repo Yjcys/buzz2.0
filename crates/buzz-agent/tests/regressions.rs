@@ -3619,3 +3619,260 @@ async fn failed_summarize_burns_handoff_attempt_budget() {
 
     h.shutdown().await;
 }
+
+// ---- unstructured tool calls (#7982) ----
+
+/// An OpenAI-compatible response that ends the turn with a tool call written
+/// into the reply text, as some served models do without a tool parser.
+fn openai_text_form_call(tool: &str) -> Value {
+    openai_text(&format!(
+        "<tool_call>{{\"name\": \"{tool}\", \"arguments\": {{}}}}</tool_call>"
+    ))
+}
+
+/// `finish_reason: tool_calls` with no `tool_calls` on the message.
+fn openai_tool_use_without_calls() -> Value {
+    json!({
+        "id": "cc-empty", "object": "chat.completion", "model": "fake-model",
+        "choices": [{
+            "index": 0,
+            "message": { "role": "assistant", "content": "" },
+            "finish_reason": "tool_calls",
+        }],
+    })
+}
+
+/// A call written as text must not run, and must not silently end the turn:
+/// the model is told it did not run and re-issues it as a real call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_form_tool_call_is_reported_and_reissued_not_run() {
+    let llm = spawn_capturing_llm(vec![
+        openai_text_form_call("fake__tool_0"),
+        openai_tool_call("real-call", "fake__tool_0", json!({})),
+        openai_text("done"),
+    ])
+    .await;
+    let mut h = Harness::spawn(&llm.url).await;
+    let sid = init_session_with_fake_mcp(&mut h, &[("FAKE_MCP_TOOL_COUNT", "1")]).await;
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
+        )
+        .await;
+    let mut tool_call_updates = 0;
+    let reply = h
+        .recv_until_approving(|v| {
+            if v["params"]["update"]["sessionUpdate"] == "tool_call" {
+                tool_call_updates += 1;
+            }
+            v["id"] == json!(prompt_id)
+        })
+        .await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+    assert_eq!(
+        tool_call_updates, 1,
+        "only the structured call may reach the tool pipeline"
+    );
+    let requests = llm.captured.lock().await;
+    assert_eq!(requests.len(), 3);
+    let retry = requests[1].to_string();
+    assert!(
+        retry.contains("was NOT executed") && retry.contains("fake__tool_0"),
+        "recovery message missing from the retry request: {retry}"
+    );
+    assert!(requests[2].to_string().contains("real-call"));
+    drop(requests);
+    h.shutdown().await;
+}
+
+/// `stop=tool_use` with zero calls used to fail the whole turn, which made the
+/// harness replay the batch. It now recovers in-turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_use_stop_without_calls_recovers_in_turn() {
+    let llm = spawn_capturing_llm(vec![openai_tool_use_without_calls(), openai_text("done")]).await;
+    let mut h = Harness::spawn(&llm.url).await;
+    let sid = init_session(&mut h, json!([])).await;
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
+        )
+        .await;
+    let reply = h.recv_until(|v| v["id"] == json!(prompt_id)).await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+    let requests = llm.captured.lock().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1]
+        .to_string()
+        .contains("signaled a tool call but contained none"));
+    drop(requests);
+    h.shutdown().await;
+}
+
+/// The recovery budget is exact: with one retry allowed, a model that keeps
+/// writing calls as text gets one reminder and then the turn ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_form_tool_call_recovery_is_bounded() {
+    let llm = spawn_capturing_llm(vec![
+        openai_text_form_call("fake__tool_0"),
+        openai_text_form_call("fake__tool_0"),
+        openai_text("must not be requested"),
+    ])
+    .await;
+    let mut h =
+        Harness::spawn_with_env(&llm.url, &[("BUZZ_AGENT_MAX_TOOL_FORMAT_RECOVERIES", "1")]).await;
+    let sid = init_session_with_fake_mcp(&mut h, &[("FAKE_MCP_TOOL_COUNT", "1")]).await;
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
+        )
+        .await;
+    let reply = h.recv_until(|v| v["id"] == json!(prompt_id)).await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+    assert_eq!(llm.captured.lock().await.len(), 2);
+    assert!(h
+        .stderr_text()
+        .contains("recovery budget exhausted, ending turn"));
+    h.shutdown().await;
+}
+
+/// Zero disables the recovery and keeps the old terminal error for
+/// `stop=tool_use` with zero calls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_tool_format_recoveries_keeps_tool_use_error() {
+    let llm =
+        spawn_capturing_llm(vec![openai_tool_use_without_calls(), openai_text("unused")]).await;
+    let mut h =
+        Harness::spawn_with_env(&llm.url, &[("BUZZ_AGENT_MAX_TOOL_FORMAT_RECOVERIES", "0")]).await;
+    let sid = init_session(&mut h, json!([])).await;
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
+        )
+        .await;
+    let reply = h.recv_until(|v| v["id"] == json!(prompt_id)).await;
+    assert!(reply.get("error").is_some(), "{reply}");
+    assert_eq!(llm.captured.lock().await.len(), 1);
+    h.shutdown().await;
+}
+
+// ---- observation masking ----
+
+fn openai_tool_call_with_usage(id: &str, prompt_tokens: u64) -> Value {
+    let mut v = openai_tool_call(id, "fake__tool_0", json!({}));
+    v["usage"] = json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": 1,
+        "total_tokens": prompt_tokens + 1,
+    });
+    v
+}
+
+/// Three tool rounds of 20 KB output in a 100k window. After the third round
+/// the projection (~95k) is past the 90% handoff threshold. Masking the two
+/// older results first brings it back under, so no summarize call is made.
+/// The control run with masking disabled pins that the same script does hand
+/// off, so the test fails if the masking rung stops working.
+async fn run_three_heavy_rounds(mask_pct: &str, tail: Vec<Value>) -> (Vec<Value>, String) {
+    let mut responses = vec![
+        openai_tool_call_with_usage("tc1", 1_000),
+        openai_tool_call_with_usage("tc2", 21_500),
+        openai_tool_call_with_usage("tc3", 75_000),
+    ];
+    responses.extend(tail);
+    let llm = spawn_capturing_llm(responses).await;
+    let mut h = Harness::spawn_with_env(
+        &llm.url,
+        &[
+            ("BUZZ_AGENT_MAX_CONTEXT_TOKENS", "100000"),
+            ("BUZZ_AGENT_MAX_OUTPUT_TOKENS", "1000"),
+            ("BUZZ_AGENT_OBSERVATION_MASK_PCT", mask_pct),
+            ("BUZZ_AGENT_OBSERVATION_MASK_KEEP_ROUNDS", "1"),
+            (
+                "BUZZ_AGENT_MAX_HISTORY_BYTES",
+                &(16 * 1024 * 1024).to_string(),
+            ),
+        ],
+    )
+    .await;
+    let sid = init_session_with_fake_mcp(
+        &mut h,
+        &[
+            ("FAKE_MCP_TOOL_COUNT", "1"),
+            ("FAKE_MCP_RESULT_SIZE", "20000"),
+        ],
+    )
+    .await;
+    let p = h
+        .send(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"go"}]}),
+        )
+        .await;
+    let reply = h.recv_until_approving(|v| v["id"] == json!(p)).await;
+    assert_eq!(reply["result"]["stopReason"], "end_turn", "{reply}");
+    let requests = llm.captured.lock().await.clone();
+    let stderr = h.stderr_text();
+    h.shutdown().await;
+    (requests, stderr)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observation_mask_reclaims_context_before_a_handoff() {
+    let (requests, stderr) = run_three_heavy_rounds("60", vec![openai_text("done")]).await;
+    assert_eq!(
+        requests.len(),
+        4,
+        "masking should have avoided the summarize call; stderr={stderr}"
+    );
+    let last = requests[3].to_string();
+    assert_eq!(
+        last.matches("[Cleared to save context]").count(),
+        2,
+        "both older results should be masked: {last}"
+    );
+    assert!(
+        last.contains("tc1") && last.contains("tc2") && last.contains("tc3"),
+        "tool call/result pairing ids must survive masking"
+    );
+    assert_eq!(
+        last.matches(&"x".repeat(20_000)).count(),
+        1,
+        "exactly the newest result must stay intact"
+    );
+    assert!(stderr.contains("observation mask: cleared 2 old tool results"));
+    assert!(!stderr.contains("handoff #1"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_masking_the_same_turn_hands_off() {
+    let (requests, stderr) = run_three_heavy_rounds(
+        "0",
+        vec![openai_text("handoff summary text"), openai_text("done")],
+    )
+    .await;
+    assert_eq!(
+        requests.len(),
+        5,
+        "expected a summarize call; stderr={stderr}"
+    );
+    assert!(stderr.contains("handoff #1"));
+    assert!(!stderr.contains("observation mask"));
+}
+
+#[test]
+fn observation_mask_pct_must_stay_below_the_handoff_threshold() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_buzz-agent"))
+        .env("BUZZ_AGENT_PROVIDER", "openai")
+        .env("OPENAI_COMPAT_API_KEY", "k")
+        .env("OPENAI_COMPAT_MODEL", "m")
+        .env("BUZZ_AGENT_OBSERVATION_MASK_PCT", "90")
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn buzz-agent");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("BUZZ_AGENT_OBSERVATION_MASK_PCT"));
+}

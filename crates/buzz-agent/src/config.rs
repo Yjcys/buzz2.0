@@ -550,6 +550,12 @@ pub struct Config {
     /// output-truncated response. Zero disables truncation recovery. This is
     /// independent of `max_rounds`, which still bounds all successful calls.
     pub max_token_recoveries: u32,
+    /// Maximum retries after the model announces a tool call it never
+    /// structures (`stop=tool_use` with zero calls) or writes one into its
+    /// reply text. The call is never executed; the model is told it did not run
+    /// and may re-issue it. Zero disables the recovery. Set via
+    /// `BUZZ_AGENT_MAX_TOOL_FORMAT_RECOVERIES`; default 2.
+    pub max_tool_format_recoveries: u32,
     pub llm_timeout: Duration,
     pub tool_timeout: Duration,
     pub mcp_init_timeout: Duration,
@@ -577,6 +583,14 @@ pub struct Config {
     /// session can compact on every successive turn without hitting this bound.
     /// Set via `BUZZ_AGENT_MAX_HANDOFFS`. Default 10.
     pub max_handoffs: usize,
+    /// Percent of `max_context_tokens` at which old tool output is masked,
+    /// the cheap rung before a handoff (see `observation_mask`). Zero disables
+    /// masking; otherwise it must stay below the 90% handoff threshold. Set via
+    /// `BUZZ_AGENT_OBSERVATION_MASK_PCT`; default 60.
+    pub observation_mask_pct: u64,
+    /// Number of newest tool rounds whose output is never masked. Set via
+    /// `BUZZ_AGENT_OBSERVATION_MASK_KEEP_ROUNDS`; default 3, minimum 1.
+    pub observation_mask_keep_rounds: usize,
     pub max_parallel_tools: usize,
     /// Process-wide cap on simultaneously-outstanding `session/request_permission`
     /// asks. Bounds the [`PermissionBroker`](crate::permission::PermissionBroker)
@@ -717,6 +731,7 @@ impl Config {
             max_rounds: parse_env("BUZZ_AGENT_MAX_ROUNDS", 0)?,
             max_output_tokens: parse_env("BUZZ_AGENT_MAX_OUTPUT_TOKENS", 65_536)?,
             max_token_recoveries: parse_env("BUZZ_AGENT_MAX_TOKEN_RECOVERIES", 3u32)?,
+            max_tool_format_recoveries: parse_env("BUZZ_AGENT_MAX_TOOL_FORMAT_RECOVERIES", 2u32)?,
             llm_timeout: Duration::from_secs(parse_env("BUZZ_AGENT_LLM_TIMEOUT_SECS", 240)?),
             tool_timeout: Duration::from_secs(parse_env("BUZZ_AGENT_TOOL_TIMEOUT_SECS", 1_260)?),
             mcp_init_timeout: Duration::from_secs(parse_env(
@@ -735,6 +750,11 @@ impl Config {
             )?,
             max_context_tokens: parse_env("BUZZ_AGENT_MAX_CONTEXT_TOKENS", 200_000u64)?,
             max_handoffs: parse_env("BUZZ_AGENT_MAX_HANDOFFS", 10)?,
+            observation_mask_pct: parse_env("BUZZ_AGENT_OBSERVATION_MASK_PCT", 60u64)?,
+            observation_mask_keep_rounds: parse_env(
+                "BUZZ_AGENT_OBSERVATION_MASK_KEEP_ROUNDS",
+                3usize,
+            )?,
             max_parallel_tools: parse_env("BUZZ_AGENT_MAX_PARALLEL_TOOLS", 8usize)?,
             max_pending_permissions: parse_env("BUZZ_AGENT_MAX_PENDING_PERMISSIONS", 32usize)?,
             permission_timeout: Duration::from_secs(parse_env(
@@ -782,6 +802,7 @@ impl Config {
             max_rounds: 0,
             max_output_tokens: 1,
             max_token_recoveries: 0,
+            max_tool_format_recoveries: 0,
             llm_timeout: Duration::from_secs(30),
             tool_timeout: Duration::from_secs(30),
             mcp_init_timeout: Duration::from_secs(30),
@@ -794,6 +815,8 @@ impl Config {
             max_tool_result_text_bytes: 50 * 1024,
             max_context_tokens: 200_001,
             max_handoffs: 0,
+            observation_mask_pct: 0,
+            observation_mask_keep_rounds: 3,
             max_parallel_tools: 1,
             max_pending_permissions: 32,
             permission_timeout: Duration::from_secs(330),
@@ -823,6 +846,15 @@ impl Config {
                 "config: BUZZ_AGENT_MAX_CONTEXT_TOKENS ({}) must be > BUZZ_AGENT_MAX_OUTPUT_TOKENS ({}) — the context window must leave room for the response",
                 self.max_context_tokens, self.max_output_tokens
             ));
+        }
+        if self.observation_mask_pct >= 90 {
+            return Err(format!(
+                "config: BUZZ_AGENT_OBSERVATION_MASK_PCT ({}) must be below the 90% handoff threshold (0 disables)",
+                self.observation_mask_pct
+            ));
+        }
+        if self.observation_mask_keep_rounds < 1 {
+            return Err("config: BUZZ_AGENT_OBSERVATION_MASK_KEEP_ROUNDS must be >= 1".into());
         }
         if self.max_history_bytes < MIN_HISTORY_BYTES {
             return Err(format!(

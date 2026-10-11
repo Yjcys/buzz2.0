@@ -14,6 +14,7 @@ mod observer;
 mod pool;
 mod pool_lifecycle;
 mod prompt_framing;
+mod prompt_profile;
 mod prompt_project;
 mod queue;
 mod recovery_wake;
@@ -962,6 +963,13 @@ async fn authorize_normal_listener_event(
     channel_info: &pool::ChannelInfoResolver,
     rest_client: &relay::RestClient,
 ) -> Option<AuthorizedListenerEvent> {
+    // A harness failure notice is for the humans in the channel. Sibling
+    // agents pass the author gate below, so without this check broken agents
+    // keep waking each other with their notices (#7778).
+    if pool::is_failure_notice(&buzz_event.event) {
+        tracing::debug!(channel_id = %buzz_event.channel_id, "dropping agent failure notice");
+        return None;
+    }
     author_gate
         .authorize_listener_event(
             buzz_event,
@@ -7456,6 +7464,84 @@ mod author_gate_tests {
             .expect("signed workflow event")
     }
 
+    /// #7778: a sibling agent's failure notice must not wake this agent,
+    /// while an ordinary message from the same sibling still passes the
+    /// owner-only gate. Without the notice check both are admitted, and
+    /// several broken agents in one channel wake each other indefinitely.
+    #[tokio::test]
+    async fn sibling_failure_notice_is_dropped_but_sibling_messages_pass() {
+        let relay_hex = nostr::Keys::generate().public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let owner = nostr::Keys::generate().public_key().to_hex();
+        let sibling = nostr::Keys::generate();
+        let (rest_client, server) = nip11_scripted_server(std::collections::VecDeque::from([Ok(
+            serde_json::json!({ "self": relay_hex }),
+        )]))
+        .await;
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "test").await;
+        let owner_cache = OwnerCache::new(Some(owner));
+        owner_cache.cache_sibling(sibling.public_key().to_hex(), true);
+        let channel_id = Uuid::new_v4();
+        let channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "team".into(),
+                    channel_type: "stream".into(),
+                    description: None,
+                },
+            )]),
+            rest_client.clone(),
+        );
+
+        let notice = pool::build_failure_notice_event(
+            &sibling,
+            channel_id,
+            &queue::ThreadTags::default(),
+            "⚠️ I couldn't process the last request.",
+        )
+        .expect("failure notice");
+        assert!(pool::is_failure_notice(&notice));
+        let message = buzz_sdk::build_message(
+            channel_id,
+            "please check the build",
+            None,
+            &[],
+            false,
+            &[],
+            &[],
+        )
+        .expect("message")
+        .sign_with_keys(&sibling)
+        .expect("sign");
+        assert!(!pool::is_failure_notice(&message));
+
+        let mut admit = Vec::new();
+        for event in [notice, message] {
+            let admitted = authorize_normal_listener_event(
+                &mut gate,
+                relay::BuzzEvent {
+                    connection_generation: 0,
+                    channel_id,
+                    event,
+                },
+                &RespondTo::OwnerOnly,
+                &HashSet::new(),
+                &owner_cache,
+                &channel_info,
+                &rest_client,
+            )
+            .await;
+            admit.push(admitted.is_some());
+        }
+        server.abort();
+        assert_eq!(
+            admit,
+            [false, true],
+            "notice must be dropped, message admitted"
+        );
+    }
+
     struct ListenerBoundaryScenario<'a> {
         listener: ListenerBoundary,
         relay_keys: &'a nostr::Keys,
@@ -10137,6 +10223,7 @@ mod build_mcp_servers_tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            prompt_profile: crate::prompt_profile::PromptProfile::Full,
         }
     }
 
@@ -11234,6 +11321,7 @@ mod error_outcome_emission_tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            prompt_profile: crate::prompt_profile::PromptProfile::Full,
         }
     }
 

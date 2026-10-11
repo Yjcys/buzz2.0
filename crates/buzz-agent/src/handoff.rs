@@ -4,7 +4,13 @@ use crate::config::{
     HANDOFF_ORIGINAL_TASK_MAX_BYTES, MAX_CONTEXT_RECOVERIES_PER_RUN,
 };
 use crate::llm::summary_completion_cap;
+use crate::observation_mask::{mask_old_tool_results, MIN_FREED_BYTES};
 use crate::types::HistoryItem;
+
+/// Bytes per token used to turn masked bytes into a token reduction.
+/// Deliberately high, so the freed amount is understated and the handoff gate
+/// errs toward compacting rather than past the window.
+const MASKED_BYTES_PER_TOKEN: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HandoffTokenCounts {
@@ -45,14 +51,65 @@ pub(crate) enum ContextRecovery {
 static HANDOFF_SYSTEM_PROMPT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
         "You are generating a context handoff summary for the next turn of an autonomous agent. \
-         Be concise but thorough. Cover: what the original task was, what you accomplished, key \
-         decisions made, what remains, and one concrete next step. Output plain text only — no \
-         tool calls, no JSON. Keep the visible plain-text summary under \
-         {HANDOFF_MAX_OUTPUT_TOKENS} tokens."
+         The agent continues from this summary alone, so keep what it cannot cheaply rediscover: \
+         exact file paths, identifiers, commands, and error messages. Use exactly these sections, \
+         in order, each a short bulleted list (write \"none\" when empty): {HANDOFF_SECTIONS}. \
+         Output plain text only — no tool calls, no JSON. Keep the visible plain-text summary \
+         under {HANDOFF_MAX_OUTPUT_TOKENS} tokens."
     )
 });
 
+/// Fixed section headings for the handoff summary. A fixed shape makes the
+/// facts the next context depends on (files, decisions, open issues) hard to
+/// drop, and makes summaries comparable across handoffs.
+const HANDOFF_SECTIONS: &str =
+    "## Goal, ## Done, ## Files and state, ## Decisions, ## Open issues, ## Next step";
+
 impl RunCtx<'_> {
+    /// First rung of context reclamation: once projected input crosses
+    /// `observation_mask_pct` of the window, mask old tool output (see
+    /// `observation_mask`). Runs before the handoff gate, which then sees the
+    /// reduced projection and only fires if masking was not enough.
+    pub(crate) fn maybe_mask_observations(&mut self) {
+        let pct = self.cfg.observation_mask_pct;
+        if pct == 0 {
+            return;
+        }
+        let threshold = self.cfg.max_context_tokens / 100 * pct;
+        let before = self.projected_handoff_input_tokens();
+        if before < threshold {
+            return;
+        }
+        let stats = mask_old_tool_results(
+            self.history,
+            self.cfg.observation_mask_keep_rounds,
+            MIN_FREED_BYTES,
+        );
+        if stats.masked == 0 {
+            return;
+        }
+        // The provider's last token count describes history that just shrank.
+        // Lower it by an understated estimate of what was freed, and shift the
+        // byte baseline by the same bytes so growth since that measurement is
+        // still counted.
+        if let Some(tokens) = *self.last_request_input_tokens {
+            let freed_tokens =
+                u64::try_from(stats.freed_bytes).unwrap_or(u64::MAX) / MASKED_BYTES_PER_TOKEN;
+            *self.last_request_input_tokens = Some(tokens.saturating_sub(freed_tokens));
+            if let Some(bytes) = *self.last_request_history_bytes {
+                *self.last_request_history_bytes = Some(bytes.saturating_sub(stats.freed_bytes));
+            }
+        }
+        let after = self.projected_handoff_input_tokens();
+        tracing::info!(
+            session_id = self.session_id,
+            masked = stats.masked,
+            freed_bytes = stats.freed_bytes,
+            "observation mask: cleared {} old tool results ({before} -> {after} projected tokens)",
+            stats.masked,
+        );
+    }
+
     pub(crate) async fn maybe_handoff(&mut self, handoff_attempts: &mut usize) -> HandoffOutcome {
         if !self.should_handoff() {
             return HandoffOutcome::Skipped;
@@ -324,10 +381,12 @@ impl RunCtx<'_> {
             }
             head.push('\n');
         }
-        let tail = "\n# Instructions\n\
-             Produce a context handoff summary covering: (1) original task, \
-             (2) what was accomplished, (3) key decisions, (4) what remains, \
-             (5) one concrete next step. Be concise but thorough. Plain text.\n";
+        let tail = format!(
+            "\n# Instructions\n\
+             Write the handoff summary with the sections {HANDOFF_SECTIONS}. Keep exact \
+             paths, identifiers, and error text. Plain text.\n"
+        );
+        let tail = tail.as_str();
         let history_header = "\n# Session History (oldest first)\n";
         let fixed_bytes = head.len() + history_header.len() + tail.len();
         // An explicit budget is the allowance for the whole prompt, so subtract

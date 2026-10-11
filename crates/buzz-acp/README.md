@@ -119,6 +119,7 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
 | `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn (safety valve). |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
+| `BUZZ_ACP_PROMPT_PROFILE` | no | `full` | `full` sends the whole base prompt. `chat` keeps only the sections every agent needs and writes project, repository, agent-creation and engineering guidance to `.agents/skills/buzz-workflows/SKILL.md` under the working directory; the prompt tells the agent to read it when a task needs it. Falls back to `full` if the file cannot be written. |
 
 **Note:** `BUZZ_ACP_AGENT_ARGS` splits on commas. For args with values, use: `-c,key="value"`.
 

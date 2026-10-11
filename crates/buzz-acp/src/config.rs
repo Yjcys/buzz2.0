@@ -442,6 +442,19 @@ pub struct CliArgs {
     )]
     pub base_prompt_file: Option<PathBuf>,
 
+    /// How much of the base prompt every session carries. full (default): the
+    /// whole prompt, for coding agents. chat: core sections only; project,
+    /// repository, agent-creation and engineering guidance is written to an
+    /// on-demand skill under `.agents/skills/buzz-workflows/` in the working
+    /// directory, and the prompt tells the agent to read it when needed.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_PROMPT_PROFILE",
+        default_value = "full",
+        value_enum
+    )]
+    pub prompt_profile: crate::prompt_profile::PromptProfile,
+
     /// Desired LLM model ID. Applied to every new ACP session after creation.
     /// Use `buzz-acp models` to discover available model IDs.
     #[arg(long, env = "BUZZ_ACP_MODEL")]
@@ -634,6 +647,8 @@ pub struct Config {
     /// `from_cli()`. `None` when using the compiled-in default or when
     /// `--no-base-prompt` is set.
     pub base_prompt_content: Option<String>,
+    /// Base-prompt profile; see [`crate::prompt_profile`].
+    pub prompt_profile: crate::prompt_profile::PromptProfile,
 }
 
 /// Maximum length, in characters, of a session title sent to the adapter.
@@ -1209,6 +1224,7 @@ impl Config {
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
             no_base_prompt: args.no_base_prompt,
             base_prompt_content,
+            prompt_profile: args.prompt_profile,
         };
 
         Ok(config)
@@ -1587,6 +1603,7 @@ mod tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            prompt_profile: crate::prompt_profile::PromptProfile::Full,
         }
     }
 
@@ -2707,6 +2724,30 @@ channels = "ALL"
     }
 
     // ── Session policy parsing + default ──────────────────────────────────────
+
+    #[test]
+    fn test_prompt_profile_defaults_to_full() {
+        let args = CliArgs::parse_from(["buzz-acp", "--private-key", &"0".repeat(64)]);
+        assert_eq!(
+            args.prompt_profile,
+            crate::prompt_profile::PromptProfile::Full
+        );
+    }
+
+    #[test]
+    fn test_prompt_profile_chat_flag_parses() {
+        let args = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &"0".repeat(64),
+            "--prompt-profile",
+            "chat",
+        ]);
+        assert_eq!(
+            args.prompt_profile,
+            crate::prompt_profile::PromptProfile::Chat
+        );
+    }
 
     #[test]
     fn test_session_policy_default_is_channel() {

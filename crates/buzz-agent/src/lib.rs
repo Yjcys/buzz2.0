@@ -12,7 +12,9 @@ mod hints;
 mod llm;
 mod mcp;
 pub mod model_capabilities;
+mod observation_mask;
 mod permission;
+mod text_tool_call;
 pub mod types;
 mod wire;
 

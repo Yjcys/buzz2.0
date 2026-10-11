@@ -15,6 +15,7 @@ use crate::llm::Llm;
 use crate::mcp::McpRegistry;
 use crate::mcp::ResultBudget;
 use crate::permission::PermissionDecision;
+use crate::text_tool_call;
 
 use crate::types::{
     AgentError, CacheTotalState, ContentBlock, HistoryItem, PricingIdentity, ProviderStop,
@@ -33,6 +34,41 @@ const UNSUPPORTED_IMAGE_TOOL_MESSAGE: &str = "The current model does not support
 /// result because truncation can happen without a tool call (and an unpaired
 /// tool result is invalid on every provider wire format).
 const MAX_TOKENS_RECOVERY_MESSAGE: &str = "Your previous response reached the model's output token limit and was truncated. Any incomplete tool calls were discarded and were not run. Stop prolonged internal reasoning now. Use the available tools immediately: write a script or artifact to a file and run it in small, verifiable steps instead of emitting the entire solution inline. Continue the task concisely from the preserved text.";
+
+/// A tool call the model meant to make but did not issue through the
+/// structured tool-calling interface. Neither kind was executed.
+enum MalformedToolCall {
+    /// The provider stopped for tool use but returned no tool calls.
+    Missing,
+    /// The reply text contains a call to this registered tool.
+    InText(String),
+}
+
+impl MalformedToolCall {
+    fn label(&self) -> &str {
+        match self {
+            Self::Missing => "missing",
+            Self::InText(_) => "in_text",
+        }
+    }
+
+    /// Model-visible feedback. A user message, like the max-tokens recovery:
+    /// there is no structured call to pair a tool result with.
+    fn recovery_message(&self) -> String {
+        match self {
+            Self::Missing => "Your previous response signaled a tool call but contained none, so \
+                nothing was executed. If you still need a tool, call it again through the \
+                tool-calling interface. Otherwise, continue."
+                .to_string(),
+            Self::InText(name) => format!(
+                "Your previous response wrote a call to `{name}` as plain text, so it was NOT \
+                 executed. Tools run only when called through the tool-calling interface. If \
+                 you still need it, call it again that way. If the text was meant as part of \
+                 your answer, continue without calling it."
+            ),
+        }
+    }
+}
 
 /// Remove image blocks that the provider has explicitly rejected while keeping
 /// their surrounding tool result (and therefore the tool-call/result pairing)
@@ -369,6 +405,9 @@ impl RunCtx<'_> {
         // these successful provider requests consume a real round and are not
         // refunded; this counter only bounds the default-unlimited case.
         let mut max_tokens_recoveries = 0u32;
+        // Per-run budget for re-asking after an unstructured tool call. Like
+        // max-tokens recovery, each retry consumes a real round.
+        let mut tool_format_recoveries = 0u32;
         loop {
             if self.cfg.max_rounds > 0 && round >= self.cfg.max_rounds {
                 return Ok(StopReason::MaxTurnRequests);
@@ -381,6 +420,7 @@ impl RunCtx<'_> {
             // its next request — the turn continues, it is not restarted. Drain
             // non-blocking; an empty queue is the common case.
             self.drain_steers();
+            self.maybe_mask_observations();
             match self.maybe_handoff(&mut handoff_attempts).await {
                 HandoffOutcome::Cancelled => return Ok(StopReason::Cancelled),
                 // Context was just reset — the prior request's token count no
@@ -702,10 +742,44 @@ impl RunCtx<'_> {
             }
 
             if response.tool_calls.is_empty() {
-                if response.stop == ProviderStop::ToolUse {
-                    return Err(AgentError::Llm(
-                        "provider: stop=tool_use but zero tool_calls".into(),
-                    ));
+                // The model meant to call a tool but the call never arrived in
+                // structured form. Failing the turn (stop=tool_use) makes the
+                // harness replay work that may already have side effects, and
+                // ending it (a call written as text) loses the call silently.
+                // Tell the model nothing ran and let it re-issue the call.
+                let malformed = match response.stop {
+                    ProviderStop::ToolUse => Some(MalformedToolCall::Missing),
+                    ProviderStop::EndTurn => text_tool_call::detect(&response.text, &tools)
+                        .map(MalformedToolCall::InText),
+                    _ => None,
+                };
+                if let Some(malformed) = malformed {
+                    if tool_format_recoveries < self.cfg.max_tool_format_recoveries {
+                        tool_format_recoveries += 1;
+                        tracing::warn!(
+                            kind = malformed.label(),
+                            recovery = tool_format_recoveries,
+                            max_recoveries = self.cfg.max_tool_format_recoveries,
+                            "tool call not issued in structured form; asking model to re-issue"
+                        );
+                        self.history.push(HistoryItem::Assistant {
+                            text: response.text,
+                            tool_calls: Vec::new(),
+                            reasoning_details: response.reasoning_details,
+                        });
+                        self.history
+                            .push(HistoryItem::User(malformed.recovery_message()));
+                        continue;
+                    }
+                    if matches!(malformed, MalformedToolCall::Missing) {
+                        return Err(AgentError::Llm(
+                            "provider: stop=tool_use but zero tool_calls".into(),
+                        ));
+                    }
+                    tracing::warn!(
+                        recoveries = tool_format_recoveries,
+                        "tool call written as text; recovery budget exhausted, ending turn"
+                    );
                 }
                 // Capture before response.text is moved into history.
                 let text_is_empty = response.text.trim().is_empty();

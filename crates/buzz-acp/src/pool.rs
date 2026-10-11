@@ -5522,6 +5522,20 @@ pub(crate) async fn post_failure_notice(
     }
 }
 
+/// Marker tag on harness failure notices. A notice is meant for the humans in
+/// the channel, and no agent may treat it as a request: sibling agents pass the
+/// author gate, so untagged notices let several broken agents wake each other
+/// indefinitely (#7778).
+pub(crate) const FAILURE_NOTICE_TAG: [&str; 2] = ["buzz", "failure-notice"];
+
+/// Whether `event` carries [`FAILURE_NOTICE_TAG`].
+pub(crate) fn is_failure_notice(event: &nostr::Event) -> bool {
+    event.tags.iter().any(|tag| {
+        let parts = tag.as_slice();
+        parts.len() >= 2 && parts[0] == FAILURE_NOTICE_TAG[0] && parts[1] == FAILURE_NOTICE_TAG[1]
+    })
+}
+
 /// Build the signed failure-notice event published by [`post_failure_notice`].
 pub(crate) fn build_failure_notice_event(
     keys: &nostr::Keys,
@@ -5556,7 +5570,14 @@ pub(crate) fn build_failure_notice_event(
             return None;
         }
     };
-    match builder.sign_with_keys(keys) {
+    let marker = match nostr::Tag::parse(FAILURE_NOTICE_TAG) {
+        Ok(tag) => tag,
+        Err(e) => {
+            tracing::warn!(channel = %channel_id, "failure notice: marker tag failed: {e}");
+            return None;
+        }
+    };
+    match builder.tag(marker).sign_with_keys(keys) {
         Ok(e) => Some(e),
         Err(e) => {
             tracing::warn!(channel = %channel_id, "failure notice: sign failed: {e}");

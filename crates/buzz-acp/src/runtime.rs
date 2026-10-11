@@ -101,6 +101,12 @@ fn make_prompt_context(
             let base = base_prompt_content
                 .map(String::as_str)
                 .unwrap_or(include_str!("base_prompt.md"));
+            let base = crate::prompt_profile::apply(
+                config.prompt_profile,
+                base,
+                std::path::Path::new(&cwd),
+            );
+            let base = base.as_str();
             Some(if matches!(mode, SessionMode::Task) {
                 format!("{base}\n\n{}", include_str!("session_model_task.md"))
             } else {

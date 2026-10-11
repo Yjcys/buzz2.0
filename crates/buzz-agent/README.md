@@ -156,8 +156,11 @@ Everything is environment variables. No flags, no config files. (We are a subpro
 | `BUZZ_AGENT_MAX_ROUNDS` | `0` | Tool-loop iteration cap. 0 = unlimited. |
 | `BUZZ_AGENT_MAX_OUTPUT_TOKENS` | `65536` | Desired per-call ceiling. Set this at or below the served model's output limit for each agent deployment. Proactive handoff is independently based on 90% of `BUZZ_AGENT_MAX_CONTEXT_TOKENS`. |
 | `BUZZ_AGENT_MAX_TOKEN_RECOVERIES` | `3` | Retries after a successful response is truncated at the output-token limit. `0` disables recovery; the finite value and `BUZZ_AGENT_MAX_ROUNDS` prevent infinite retries. |
+| `BUZZ_AGENT_MAX_TOOL_FORMAT_RECOVERIES` | `2` | Retries after the model announces a tool call it never structures (`stop=tool_use` with no calls) or writes a call to a registered tool into its reply text. The call is never run; the model is told so and may re-issue it. `0` disables recovery. |
 | `BUZZ_AGENT_MAX_CONTEXT_TOKENS` | `200000` | Provider context window used by the handoff gate. |
 | `BUZZ_AGENT_MAX_HANDOFFS` | `10` | Max context handoffs per session before falling back to truncation. |
+| `BUZZ_AGENT_OBSERVATION_MASK_PCT` | `60` | Percent of the context window at which older tool output is replaced with a one-line placeholder, before any handoff. Must be below 90; `0` disables. See [Context reclamation](#context-reclamation). |
+| `BUZZ_AGENT_OBSERVATION_MASK_KEEP_ROUNDS` | `3` | Newest tool rounds whose output is never masked. Minimum 1. |
 | `BUZZ_AGENT_LLM_TIMEOUT_SECS` | `240` | Max seconds with no response bytes before abandoning an LLM call (per-read inactivity, not wall-clock). |
 | `BUZZ_AGENT_TOOL_TIMEOUT_SECS` | `1260` | Per-tool call timeout in seconds |
 | `BUZZ_AGENT_MAX_PARALLEL_TOOLS` | `8` | Max concurrent tool calls per turn (1 = sequential) |
@@ -167,6 +170,14 @@ Everything is environment variables. No flags, no config files. (We are a subpro
 | `BUZZ_AGENT_MAX_TOOL_RESULT_TEXT_BYTES` | `51200` | 50 KiB. Per-result cap on tool-output text; oversize is middle-elided (head + tail kept) with an inline marker. Images are exempt. |
 | `BUZZ_AGENT_REQUIRE_REPLY` | `0` (`1` on mesh) | `1` enables the [reply guard](#reply-guard) — remind the model to publish when a turn is about to end with nothing posted to Buzz. Desktop defaults it to `1` for Buzz shared-compute agents. |
 
+
+## Context reclamation
+
+Context is reclaimed in three rungs, cheapest first:
+
+1. **Observation masking** (`BUZZ_AGENT_OBSERVATION_MASK_PCT`, default 60%). Older tool results are replaced with a placeholder naming the tool, its arguments, and the size removed. Tool-call ids and assistant turns are untouched, so call/result pairing stays valid. The newest rounds, error results, and `load_skill` bodies are kept. Masking happens in batches of at least 8 KiB, since every edit invalidates the provider's prompt cache from that point on.
+2. **Handoff** at 90%: the model writes a summary in fixed sections (Goal, Done, Files and state, Decisions, Open issues, Next step) and history is reset to it.
+3. **Reactive recovery** when the provider still rejects a request for length: the handoff prompt is halved per attempt, at most three times per turn.
 
 ## Reply Guard
 
